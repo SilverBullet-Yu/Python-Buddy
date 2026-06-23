@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: python-agent-web
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements-render.txt
+    startCommand: python src/main.py -m http
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.5
+      - key: COZE_PROJECT_TYPE
+        value: agent
+      - key: COZE_WORKSPACE_PATH
+        value: /opt/render/project/src
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_BASE_URL
+        sync: false

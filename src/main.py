@@ -1,0 +1,709 @@
+﻿import argparse
+import asyncio
+import json
+import threading
+import traceback
+import logging
+import uuid
+from contextlib import asynccontextmanager
+from typing import Any, Dict, Iterable, AsyncIterable, AsyncGenerator, Optional
+import cozeloop
+import uvicorn
+import time
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+import os
+from langchain_core.runnables import RunnableConfig
+from langgraph.graph import StateGraph, END
+from langgraph.graph.state import CompiledStateGraph
+from coze_coding_utils.runtime_ctx.context import new_context, Context
+from coze_coding_utils.helper import graph_helper
+from coze_coding_utils.log.node_log import LOG_FILE
+from coze_coding_utils.log.write_log import setup_logging, request_context
+from coze_coding_utils.log.config import LOG_LEVEL
+from coze_coding_utils.error.classifier import ErrorClassifier, classify_error
+from coze_coding_utils.helper.stream_runner import AgentStreamRunner, WorkflowStreamRunner,agent_stream_handler,workflow_stream_handler, RunOpt
+from storage.database.db import get_session, get_engine
+from storage.memory.memory_saver import get_memory_saver
+from storage.database.shared.model import Base
+from coze_coding_utils.async_tasks import (
+    AsyncTaskRuntime,
+    AsyncTaskStorageError,
+    extract_biz_context,
+    parse_deadline_sec,
+)
+from coze_coding_utils.async_tasks import config as async_task_config
+from coze_coding_utils.async_tasks.headers import HEADER_X_RUN_ID as _ASYNC_HEADER_X_RUN_ID
+from coze_coding_utils.runtime_ctx.context import new_context as _new_async_ctx
+from sqlalchemy import event
+
+setup_logging(
+    log_file=LOG_FILE,
+    max_bytes=100 * 1024 * 1024, # 100MB
+    backup_count=5,
+    log_level=LOG_LEVEL,
+    use_json_format=True,
+    console_output=True
+)
+
+logger = logging.getLogger(__name__)
+from coze_coding_utils.helper.agent_helper import to_stream_input
+from coze_coding_utils.openai.handler import OpenAIChatHandler
+from coze_coding_utils.log.parser import LangGraphParser
+from coze_coding_utils.log.err_trace import extract_core_stack
+from coze_coding_utils.log.loop_trace import init_run_config, init_agent_config
+
+
+# 瓒呮椂閰嶇疆甯搁噺
+TIMEOUT_SECONDS = 900  # 15鍒嗛挓
+
+class GraphService:
+    def __init__(self):
+        # 鐢ㄤ簬璺熻釜姝ｅ湪杩愯鐨勪换鍔★紙浣跨敤asyncio.Task锛?        self.running_tasks: Dict[str, asyncio.Task] = {}
+        # 閿欒鍒嗙被鍣?        self.error_classifier = ErrorClassifier()
+        # stream runner
+        self._agent_stream_runner = AgentStreamRunner()
+        self._workflow_stream_runner = WorkflowStreamRunner()
+        self._graph = None
+        self._graph_lock = threading.Lock()
+
+    def set_graph(self, graph) -> None:
+        """Inject the compiled graph used by sync endpoints. Called once from
+        lifespan with a no-checkpointer build, so /run /stream_run /node_run
+        never hit the checkpoint DB."""
+        self._graph = graph
+
+    def _get_graph(self, ctx=Context):
+        if self._graph is not None:
+            return self._graph
+        with self._graph_lock:
+            if self._graph is not None:
+                return self._graph
+            if graph_helper.is_agent_proj():
+                self._graph = graph_helper.get_agent_instance("agents.agent", ctx)
+            else:
+                self._graph = graph_helper.get_graph_instance("graphs.graph")
+            return self._graph
+
+    @staticmethod
+    def _sse_event(data: Any, event_id: Any = None) -> str:
+        id_line = f"id: {event_id}\n" if event_id else ""
+        return f"{id_line}event: message\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+
+    def _get_stream_runner(self):
+        if graph_helper.is_agent_proj():
+            return self._agent_stream_runner
+        else:
+            return self._workflow_stream_runner
+
+    # 娴佸紡杩愯锛堝師濮嬭凯浠ｅ櫒锛夛細鏈湴璋冪敤浣跨敤
+    def stream(self, payload: Dict[str, Any], run_config: RunnableConfig, ctx=Context) -> Iterable[Any]:
+        graph = self._get_graph(ctx)
+        stream_runner = self._get_stream_runner()
+        for chunk in stream_runner.stream(payload, graph, run_config, ctx):
+            yield chunk
+
+    # 鍚屾杩愯锛氭湰鍦?HTTP 閫氱敤
+    async def run(self, payload: Dict[str, Any], ctx=None) -> Dict[str, Any]:
+        if ctx is None:
+            ctx = new_context("run")
+
+        run_id = ctx.run_id
+        logger.info(f"Starting run with run_id: {run_id}")
+
+        try:
+            graph = self._get_graph(ctx)
+            # custom tracer
+            run_config = init_run_config(graph, ctx)
+            run_config.setdefault("configurable", {})["thread_id"] = ctx.run_id
+
+            # 鐩存帴璋冪敤锛孡angGraph浼氬湪褰撳墠浠诲姟涓婁笅鏂囦腑鎵ц
+            # 濡傛灉褰撳墠浠诲姟琚彇娑堬紝LangGraph鐨勬墽琛屼篃浼氳鍙栨秷
+            return await graph.ainvoke(payload, config=run_config, context=ctx)
+
+        except asyncio.CancelledError:
+            logger.info(f"Run {run_id} was cancelled")
+            return {"status": "cancelled", "run_id": run_id, "message": "Execution was cancelled"}
+        except Exception as e:
+            # 浣跨敤閿欒鍒嗙被鍣ㄥ垎绫婚敊璇?            err = self.error_classifier.classify(e, {"node_name": "run", "run_id": run_id})
+            # 璁板綍璇︾粏鐨勯敊璇俊鎭拰鍫嗘爤璺熻釜
+            logger.error(
+                f"Error in GraphService.run: [{err.code}] {err.message}\n"
+                f"Category: {err.category.name}\n"
+                f"Traceback:\n{extract_core_stack()}"
+            )
+            # 淇濈暀鍘熷寮傚父鍫嗘爤锛屼究浜庝笂灞傝繑鍥炵湡姝ｇ殑鎶ラ敊浣嶇疆
+            raise
+        finally:
+            # 娓呯悊浠诲姟璁板綍
+            self.running_tasks.pop(run_id, None)
+
+    # 娴佸紡杩愯锛圫SE 鏍煎紡鍖栵級锛欻TTP 璺敱浣跨敤
+    async def stream_sse(self, payload: Dict[str, Any], ctx=None, run_opt: Optional[RunOpt] = None) -> AsyncGenerator[str, None]:
+        if ctx is None:
+            ctx = new_context(method="stream_sse")
+        if run_opt is None:
+            run_opt = RunOpt()
+
+        run_id = ctx.run_id
+        logger.info(f"Starting stream with run_id: {run_id}")
+        graph = self._get_graph(ctx)
+        if graph_helper.is_agent_proj():
+            run_config = init_agent_config(graph, ctx)
+        else:
+            run_config = init_run_config(graph, ctx)  # vibeflow
+
+        is_workflow = not graph_helper.is_agent_proj()
+
+        try:
+            async for chunk in self.astream(payload, graph, run_config=run_config, ctx=ctx, run_opt=run_opt):
+                if is_workflow and isinstance(chunk, tuple):
+                    event_id, data = chunk
+                    yield self._sse_event(data, event_id)
+                else:
+                    yield self._sse_event(chunk)
+        finally:
+            # 娓呯悊浠诲姟璁板綍
+            self.running_tasks.pop(run_id, None)
+            cozeloop.flush()
+
+    # 取消指定 run_id 对应的异步任务。
+    def cancel_run(self, run_id: str, ctx: Optional[Context] = None) -> Dict[str, Any]:
+        """取消指定 run_id 的执行任务。"""
+        logger.info(f"Attempting to cancel run_id: {run_id}")
+
+        if run_id in self.running_tasks:
+            task = self.running_tasks[run_id]
+            if not task.done():
+                task.cancel()
+                logger.info(f"Cancellation requested for run_id: {run_id}")
+                return {
+                    "status": "success",
+                    "run_id": run_id,
+                    "message": "Cancellation signal sent, task will be cancelled at next await point",
+                }
+
+            logger.info(f"Task already completed for run_id: {run_id}")
+            return {
+                "status": "already_completed",
+                "run_id": run_id,
+                "message": "Task has already completed",
+            }
+
+        logger.warning(f"No active task found for run_id: {run_id}")
+        return {
+            "status": "not_found",
+            "run_id": run_id,
+            "message": "No active task found with this run_id. Task may have already completed or run_id is invalid.",
+        }
+    # 杩愯鎸囧畾鑺傜偣锛氭湰鍦?HTTP 閫氱敤
+    async def run_node(self, node_id: str, payload: Dict[str, Any], ctx=None) -> Any:
+        if ctx is None or Context.run_id == "":
+            ctx = new_context(method="node_run")
+
+        _graph = self._get_graph()
+        node_func, input_cls, output_cls = graph_helper.get_graph_node_func_with_inout(_graph.get_graph(), node_id)
+        if node_func is None or input_cls is None:
+            raise KeyError(f"node_id '{node_id}' not found")
+
+        parser = LangGraphParser(_graph)
+        metadata = parser.get_node_metadata(node_id) or {}
+
+        _g = StateGraph(input_cls, input_schema=input_cls, output_schema=output_cls)
+        _g.add_node("sn", node_func, metadata=metadata)
+        _g.set_entry_point("sn")
+        _g.add_edge("sn", END)
+        _graph = _g.compile()
+
+        run_config = init_run_config(_graph, ctx)
+        return await _graph.ainvoke(payload, config=run_config)
+
+    def graph_inout_schema(self) -> Any:
+        if graph_helper.is_agent_proj():
+            return {"input_schema": {}, "output_schema": {}}
+        builder = getattr(self._get_graph(), 'builder', None)
+        if builder is not None:
+            input_cls = getattr(builder, 'input_schema', None) or self.graph.get_input_schema()
+            output_cls = getattr(builder, 'output_schema', None) or self.graph.get_output_schema()
+        else:
+            logger.warning(f"No builder input schema found for graph_inout_schema, using graph input schema instead")
+            input_cls = self.graph.get_input_schema()
+            output_cls = self.graph.get_output_schema()
+
+        return {
+            "input_schema": input_cls.model_json_schema(), 
+            "output_schema": output_cls.model_json_schema(),
+            "code":0,
+            "msg":""
+        }
+
+    async def astream(self, payload: Dict[str, Any], graph: CompiledStateGraph, run_config: RunnableConfig, ctx=Context, run_opt: Optional[RunOpt] = None) -> AsyncIterable[Any]:
+        stream_runner = self._get_stream_runner()
+        async for chunk in stream_runner.astream(payload, graph, run_config, ctx, run_opt):
+            yield chunk
+
+
+service = GraphService()
+
+async_runtime: Optional[AsyncTaskRuntime] = None
+async_graph: Optional[CompiledStateGraph] = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global async_graph, async_runtime
+    async_graph = None
+    async_runtime = None
+
+    engine = None
+    checkpointer = None
+
+    try:
+        engine = get_engine()
+
+        @event.listens_for(engine, "connect")
+        def _set_utc(dbapi_conn, _):
+            with dbapi_conn.cursor() as cur:
+                cur.execute("SET TIME ZONE 'UTC'")
+
+        checkpointer = get_memory_saver()
+    except Exception as exc:
+        logger.warning(
+            "Startup degraded: database-dependent capabilities are disabled: %s",
+            exc,
+        )
+
+    if graph_helper.is_agent_proj():
+        base = graph_helper.get_agent_instance("agents.agent", None)
+        sync_graph = base.builder.compile(checkpointer=checkpointer)
+    else:
+        base = graph_helper.get_graph_instance("graphs.graph")
+        sync_graph = base.builder.compile()
+
+    service.set_graph(sync_graph)
+
+    if engine is not None and checkpointer is not None:
+        async_graph = base.builder.compile(checkpointer=checkpointer)
+        async_runtime = AsyncTaskRuntime(
+            session_factory=get_session,
+            engine=engine,
+            graph=async_graph,
+            checkpointer=checkpointer,
+        )
+
+    yield
+
+    if async_runtime is not None:
+        await async_runtime.shutdown()
+
+app = FastAPI(lifespan=lifespan)
+
+# 前端静态文件挂载。
+FRONTEND_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "frontend")
+if os.path.isdir(FRONTEND_DIR):
+    app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="frontend_static")
+
+# 注册前端所需 API 路由。
+from api.conversation_api import router as api_router
+app.include_router(api_router)
+
+@app.get("/")
+async def serve_frontend():
+    """提供独立前端页面。"""
+    index_path = os.path.join(FRONTEND_DIR, "index.html")
+    if os.path.isfile(index_path):
+        return FileResponse(index_path, media_type="text/html")
+    return {"message": "Python 小导师 API 已启动，前端文件未找到"}
+# OpenAI 兼容接口处理器。
+openai_handler = OpenAIChatHandler(service)
+
+
+@app.post("/async_run")
+async def http_async_run(request: Request) -> dict:
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error in http_async_run: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {extract_core_stack()}")
+    try:
+        deadline_sec = parse_deadline_sec(request.headers)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # 涓€涓?ID 璧板埌搴曪細task_id == run_id == thread_id == ctx.run_id == coze_run_id銆?    # 浼樺厛鐢ㄤ笂娓?x-run-id锛涙病浼犲氨鐢熸垚 UUID銆?    run_id = request.headers.get(_ASYNC_HEADER_X_RUN_ID) or uuid.uuid4().hex
+
+    # ctx 鍦?handler scope 鏋勯€狅紝涓庡悓姝?/run 璺緞涓€鑷达紱鍚庨潰 new_context 榛樿浼?    # 缁?run_id 涓€涓柊 UUID锛屽悓姝ヨ矾寰勪篃鏄樉寮忚鐩栵紙main.py /run 澶勶級锛岃繖閲屽悓鐞嗐€?    ctx = _new_async_ctx(method="async_run", headers=request.headers)
+    ctx.run_id = run_id
+    request_context.set(ctx)  # 涓庡叾浠?HTTP endpoint 涓€鑷达細璁╂棩蹇楃粍浠舵嬁鍒?run_id 绛変俊鎭?    run_config = init_run_config(async_graph, ctx)
+    run_config["recursion_limit"] = async_task_config.RECURSION_LIMIT
+    run_config.setdefault("configurable", {})["thread_id"] = run_id
+
+    biz_context = extract_biz_context(request.headers) or {}
+    biz_context[_ASYNC_HEADER_X_RUN_ID] = run_id  # 涔熺暀 DB 涓€浠芥柟渚垮璁?鎺掓煡
+
+    try:
+        return await async_runtime.submit(
+            task_id=run_id,
+            payload=payload,
+            biz_context=biz_context,
+            deadline_sec=deadline_sec,
+            run_config=run_config,
+            ctx=ctx,
+        )
+    except AsyncTaskStorageError as e:
+        raise HTTPException(status_code=503,
+                            detail=f"async-task storage unavailable: {e}")
+
+
+@app.get("/task/{task_id}")
+async def http_get_task(task_id: str) -> dict:
+    try:
+        row = await async_runtime.get(task_id)
+    except AsyncTaskStorageError as e:
+        raise HTTPException(status_code=503,
+                            detail=f"async-task storage unavailable: {e}")
+    if row is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    return row
+
+
+HEADER_X_RUN_ID = "x-run-id"
+@app.post("/run")
+async def http_run(request: Request) -> Dict[str, Any]:
+    global result
+    raw_body = await request.body()
+    try:
+        body_text = raw_body.decode("utf-8")
+    except Exception as e:
+        body_text = str(raw_body)
+        raise HTTPException(status_code=400,
+                            detail=f"Invalid JSON format: {body_text}, traceback: {traceback.format_exc()}, error: {e}")
+
+    ctx = new_context(method="run", headers=request.headers)
+    # 浼樺厛浣跨敤涓婃父鎸囧畾鐨?run_id锛屼繚璇?cancel 鑳界簿纭尮閰?    upstream_run_id = request.headers.get(HEADER_X_RUN_ID)
+    if upstream_run_id:
+        ctx.run_id = upstream_run_id
+    run_id = ctx.run_id
+    request_context.set(ctx)
+
+    logger.info(
+        f"Received request for /run: "
+        f"run_id={run_id}, "
+        f"query={dict(request.query_params)}, "
+        f"body={body_text}"
+    )
+
+    try:
+        payload = await request.json()
+
+        # 鍒涘缓浠诲姟骞惰褰?- 杩欐槸鍏抽敭锛岃鎴戜滑鍙互閫氳繃run_id鍙栨秷浠诲姟
+        task = asyncio.create_task(service.run(payload, ctx))
+        service.running_tasks[run_id] = task
+
+        try:
+            result = await asyncio.wait_for(task, timeout=float(TIMEOUT_SECONDS))
+        except asyncio.TimeoutError:
+            logger.error(f"Run execution timeout after {TIMEOUT_SECONDS}s for run_id: {run_id}")
+            task.cancel()
+            try:
+                result = await task
+            except asyncio.CancelledError:
+                return {
+                    "status": "timeout",
+                    "run_id": run_id,
+                    "message": f"Execution timeout: exceeded {TIMEOUT_SECONDS} seconds"
+                }
+
+        if not result:
+            result = {}
+        if isinstance(result, dict):
+            result["run_id"] = run_id
+        return result
+
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error in http_run: {e}, traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=400, detail=f"Invalid JSON format, {extract_core_stack()}")
+
+    except asyncio.CancelledError:
+        logger.info(f"Request cancelled for run_id: {run_id}")
+        result = {"status": "cancelled", "run_id": run_id, "message": "Execution was cancelled"}
+        return result
+
+    except Exception as e:
+        # 浣跨敤閿欒鍒嗙被鍣ㄨ幏鍙栭敊璇俊鎭?        error_response = service.error_classifier.get_error_response(e, {"node_name": "http_run", "run_id": run_id})
+        logger.error(
+            f"Unexpected error in http_run: [{error_response['error_code']}] {error_response['error_message']}, "
+            f"traceback: {traceback.format_exc()}", exc_info=True
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error_code": error_response["error_code"],
+                "error_message": error_response["error_message"],
+                "stack_trace": extract_core_stack(),
+            }
+        )
+    finally:
+        cozeloop.flush()
+
+
+HEADER_X_WORKFLOW_STREAM_MODE = "x-workflow-stream-mode"
+
+
+def _register_task(run_id: str, task: asyncio.Task):
+    service.running_tasks[run_id] = task
+
+
+@app.post("/stream_run")
+async def http_stream_run(request: Request):
+    ctx = new_context(method="stream_run", headers=request.headers)
+    # 浼樺厛浣跨敤涓婃父鎸囧畾鐨?run_id锛屼繚璇?cancel 鑳界簿纭尮閰?    upstream_run_id = request.headers.get(HEADER_X_RUN_ID)
+    if upstream_run_id:
+        ctx.run_id = upstream_run_id
+    workflow_stream_mode = request.headers.get(HEADER_X_WORKFLOW_STREAM_MODE, "").lower()
+    workflow_debug = workflow_stream_mode == "debug"
+    request_context.set(ctx)
+    raw_body = await request.body()
+    try:
+        body_text = raw_body.decode("utf-8")
+    except Exception as e:
+        body_text = str(raw_body)
+        raise HTTPException(status_code=400,
+                            detail=f"Invalid JSON format: {body_text}, traceback: {extract_core_stack()}, error: {e}")
+    run_id = ctx.run_id
+    is_agent = graph_helper.is_agent_proj()
+    logger.info(
+        f"Received request for /stream_run: "
+        f"run_id={run_id}, "
+        f"is_agent_project={is_agent}, "
+        f"query={dict(request.query_params)}, "
+        f"body={body_text}"
+    )
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error in http_stream_run: {e}, traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=400, detail=f"Invalid JSON format:{extract_core_stack()}")
+
+    if is_agent:
+        stream_generator = agent_stream_handler(
+            payload=payload,
+            ctx=ctx,
+            run_id=run_id,
+            stream_sse_func=service.stream_sse,
+            sse_event_func=service._sse_event,
+            error_classifier=service.error_classifier,
+            register_task_func=_register_task,
+        )
+    else:
+        stream_generator = workflow_stream_handler(
+            payload=payload,
+            ctx=ctx,
+            run_id=run_id,
+            stream_sse_func=service.stream_sse,
+            sse_event_func=service._sse_event,
+            error_classifier=service.error_classifier,
+            register_task_func=_register_task,
+            run_opt=RunOpt(workflow_debug=workflow_debug),
+        )
+
+    response = StreamingResponse(stream_generator, media_type="text/event-stream")
+    return response
+
+@app.post("/cancel/{run_id}")
+async def http_cancel(run_id: str, request: Request):
+    """
+    鍙栨秷鎸囧畾run_id鐨勬墽琛?
+    浣跨敤asyncio.Task.cancel()瀹炵幇鍙栨秷,杩欐槸Python鏍囧噯鐨勫紓姝ヤ换鍔″彇娑堟満鍒躲€?    LangGraph浼氬湪鑺傜偣涔嬮棿鐨刟wait鐐规鏌ancelledError,瀹炵幇浼橀泤鍙栨秷銆?    """
+    ctx = new_context(method="cancel", headers=request.headers)
+    request_context.set(ctx)
+    logger.info(f"Received cancel request for run_id: {run_id}")
+    result = service.cancel_run(run_id, ctx)
+    return result
+
+
+@app.post(path="/node_run/{node_id}")
+async def http_node_run(node_id: str, request: Request):
+    raw_body = await request.body()
+    try:
+        body_text = raw_body.decode("utf-8")
+    except UnicodeDecodeError:
+        body_text = str(raw_body)
+        raise HTTPException(status_code=400, detail=f"Invalid JSON format: {body_text}")
+    ctx = new_context(method="node_run", headers=request.headers)
+    request_context.set(ctx)
+    logger.info(
+        f"Received request for /node_run/{node_id}: "
+        f"query={dict(request.query_params)}, "
+        f"body={body_text}",
+    )
+
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error in http_node_run: {e}, traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=400, detail=f"Invalid JSON format:{extract_core_stack()}")
+    try:
+        return await service.run_node(node_id, payload, ctx)
+    except KeyError:
+        raise HTTPException(status_code=404,
+                            detail=f"node_id '{node_id}' not found or input miss required fields, traceback: {extract_core_stack()}")
+    except Exception as e:
+        # 浣跨敤閿欒鍒嗙被鍣ㄨ幏鍙栭敊璇俊鎭?        error_response = service.error_classifier.get_error_response(e, {"node_name": node_id})
+        logger.error(
+            f"Unexpected error in http_node_run: [{error_response['error_code']}] {error_response['error_message']}, "
+            f"traceback: {traceback.format_exc()}", exc_info=True
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error_code": error_response["error_code"],
+                "error_message": error_response["error_message"],
+                "stack_trace": extract_core_stack(),
+            }
+        )
+    finally:
+        cozeloop.flush()
+
+
+@app.post("/v1/chat/completions")
+async def openai_chat_completions(request: Request):
+    """OpenAI Chat Completions API 鍏煎鎺ュ彛"""
+    ctx = new_context(method="openai_chat", headers=request.headers)
+    request_context.set(ctx)
+
+    logger.info(f"Received request for /v1/chat/completions: run_id={ctx.run_id}")
+
+    try:
+        payload = await request.json()
+        return await openai_handler.handle(payload, ctx)
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error in openai_chat_completions: {e}")
+        raise HTTPException(status_code=400, detail="Invalid JSON format")
+    finally:
+        cozeloop.flush()
+
+
+@app.get("/health")
+async def health_check():
+    try:
+        # 杩欓噷鍙互娣诲姞鏇村鐨勫仴搴锋鏌ラ€昏緫
+        return {
+            "status": "ok",
+            "message": "Service is running",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.post("/refresh-frontend")
+async def refresh_frontend():
+    """重新上传前端 HTML 到对象存储，并返回新的预签名 URL。"""
+    try:
+        from coze_coding_dev_sdk.s3 import S3SyncStorage
+
+        storage = S3SyncStorage(
+            endpoint_url=os.getenv("COZE_BUCKET_ENDPOINT_URL"),
+            access_key="",
+            secret_key="",
+            bucket_name=os.getenv("COZE_BUCKET_NAME"),
+            region="cn-beijing",
+        )
+        index_path = os.path.join(FRONTEND_DIR, "index.html")
+        if not os.path.isfile(index_path):
+            raise HTTPException(status_code=404, detail="前端文件 assets/frontend/index.html 不存在")
+
+        with open(index_path, "rb") as f:
+            key = storage.upload_file(
+                file_content=f.read(),
+                file_name="frontend/index.html",
+                content_type="text/html; charset=utf-8",
+            )
+
+        url = storage.generate_presigned_url(key=key, expire_time=2592000)
+        return {"url": url, "expires_in_days": 30, "message": "前端 URL 已刷新，有效期 30 天"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get(path="/graph_parameter")
+async def http_graph_inout_parameter(request: Request):
+    return service.graph_inout_schema()
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Start FastAPI server")
+    parser.add_argument("-m", type=str, default="http", help="Run mode, support http,flow,node")
+    parser.add_argument("-n", type=str, default="", help="Node ID for single node run")
+    parser.add_argument(
+        "-p",
+        type=int,
+        default=int(os.getenv("PORT") or os.getenv("DEPLOY_RUN_PORT") or "5000"),
+        help="HTTP server port",
+    )
+    parser.add_argument("-i", type=str, default="", help="Input JSON string for flow/node mode")
+    return parser.parse_args()
+
+
+def parse_input(input_str: str) -> Dict[str, Any]:
+    """Parse input string, support both JSON string and plain text"""
+    if not input_str:
+        return {"text": "浣犲ソ"}
+
+    # Try to parse as JSON first
+    try:
+        return json.loads(input_str)
+    except json.JSONDecodeError:
+        # If not valid JSON, treat as plain text
+        return {"text": input_str}
+
+def start_http_server(port):
+    workers = 1
+    reload = False
+    if graph_helper.is_dev_env():
+        reload = True
+
+    logger.info(f"Start HTTP Server, Port: {port}, Workers: {workers}")
+    uvicorn.run(app, host="0.0.0.0", port=port, reload=reload, workers=workers)
+
+if __name__ == "__main__":
+    args = parse_args()
+    if args.m == "http":
+        start_http_server(args.p)
+    elif args.m == "flow":
+        payload = parse_input(args.i)
+        result = asyncio.run(service.run(payload))
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    elif args.m == "node" and args.n:
+        payload = parse_input(args.i)
+        result = asyncio.run(service.run_node(args.n, payload))
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    elif args.m == "agent":
+        agent_ctx = new_context(method="agent")
+        for chunk in service.stream(
+                {
+                    "type": "query",
+                    "session_id": "1",
+                    "message": "你好",
+                    "content": {
+                        "query": {
+                            "prompt": [
+                                {
+                                    "type": "text",
+                                    "content": {"text": "现在几点了？请调用工具获取当前时间。"},
+                                }
+                            ]
+                        }
+                    },
+                },
+                run_config={"configurable": {"session_id": "1"}},
+                ctx=agent_ctx,
+        ):
+            print(chunk)
+
+
+
+
+
+
+
